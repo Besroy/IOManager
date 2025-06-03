@@ -30,7 +30,7 @@ table DriveInterface {
 
     disable_io_uring: bool = false; // flag to not use io uring even if the env supports it
 
-    uring_per_thread_qdepth: uint32 = 256; // IMPORTANT: do not make this hotswap
+    uring_per_thread_qdepth: uint32 = 128; // IMPORTANT: do not make this hotswap
 }
 
 table PoolEntry {

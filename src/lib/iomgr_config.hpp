@@ -56,6 +56,12 @@ public:
             }
 
             // Any more default overrides or set non-scalar entries come here
+            auto& uring_per_thread_qdepth = s.drive.uring_per_thread_qdepth;
+            LOGINFO("Default uring per thread qdepth is {}", uring_per_thread_qdepth);
+            if (uring_per_thread_qdepth != 0) {
+                LOGINFO("Setting uring per thread qdepth to {}", uring_per_thread_qdepth);
+                is_modified = true;
+            }
         });
 
         if (is_modified) { IM_SETTINGS_FACTORY().save(); }

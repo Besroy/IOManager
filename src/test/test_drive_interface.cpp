@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
+#include <sisl/settings/settings.hpp>
 #include <sisl/options/options.h>
 #include <sisl/utility/thread_factory.hpp>
 
@@ -24,6 +25,10 @@
 #include <iomgr/iomgr.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/drive_interface.hpp>
+#include "iomgr/iomgr_config_generated.h"
+
+SETTINGS_INIT(iomgrcfg::IomgrSettings, iomgr_config);
+#define IM_SETTINGS_FACTORY() SETTINGS_FACTORY(iomgr_config)
 
 using log_level = spdlog::level::level_enum;
 
@@ -42,10 +47,15 @@ SISL_OPTION_GROUP(test_drive_interface,
                    ::cxxopts::value< std::string >()->default_value("/tmp/iomgr_test_drive"), "path"),
                   (dev_size_mb, "", "dev_size_mb", "size of each device in MB",
                    ::cxxopts::value< uint64_t >()->default_value("100"), "number"),
-                  (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"));
+                  (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"),
+                  (timeout_ms, "", "timeout_ms", "timeout in milliseconds",
+                   ::cxxopts::value< uint64_t >()->default_value("60000"), "number"),
+                  (io_size, "", "io_size", "size of each io operation in bytes",
+                   ::cxxopts::value< uint32_t >()->default_value("4096"), "number"));
 
 #define ENABLED_OPTIONS logging, iomgr, test_drive_interface, config
 SISL_OPTIONS_ENABLE(ENABLED_OPTIONS)
+
 
 using namespace iomgr;
 
@@ -139,6 +149,59 @@ public:
         if (m_created) {
             LOGINFO("Device {} was created by this test, deleting the file", m_dev_path);
             std::filesystem::remove(std::filesystem::path{m_dev_path});
+        }
+    }
+
+    void async_write_test() {
+        const uint32_t nthreads = SISL_OPTIONS["num_threads"].as<uint32_t>();
+        const uint64_t dev_size = SISL_OPTIONS["dev_size_mb"].as<uint64_t>() * 1024 * 1024;
+        const size_t each_thread_size = (dev_size - 1) / nthreads + 1;
+        const size_t io_size = SISL_OPTIONS["io_size"].as<uint32_t>();
+        const uint64_t timeout_ms = SISL_OPTIONS["timeout_ms"].as<uint64_t>();
+
+        std::vector<std::thread> threads;
+
+        for (uint32_t i = 0; i < nthreads; ++i) {
+            threads.emplace_back([this, i, each_thread_size, io_size, timeout_ms]() {
+                const size_t offset_start = i * each_thread_size;
+                const size_t offset_end = offset_start + each_thread_size;
+                int32_t written_count = 0;
+
+                std::vector<folly::Future<folly::Unit>> futures;
+
+                for (size_t offset = offset_start; offset < offset_end; offset += io_size) {
+                    auto* buf = iomanager.iobuf_alloc(s_driveattr.align_size, io_size);
+                    std::memset(buf, 0xEE, io_size);
+
+                    folly::Promise<folly::Unit> promise;
+                    auto future = promise.getFuture();
+                    futures.push_back(std::move(future));
+                    ++written_count;
+
+                    m_iodev->drive_interface()
+                        ->async_write(m_iodev.get(), r_cast<const char*>(buf), io_size, offset)
+                        .thenValue([buf, p = std::move(promise)](auto&&) mutable {
+                            iomanager.iobuf_free(buf);
+                            p.setValue();
+                        });
+                }
+
+                auto all_futs_ready = folly::collectAllUnsafe(futures).wait(std::chrono::milliseconds(timeout_ms)).isReady();
+                if (!all_futs_ready) {
+                    for (size_t j{0}; j < futures.size(); ++j) {
+                        if (!futures[j].isReady()) {
+                            LOGERROR("Thread {} timed out while waiting for {} write request {} to complete.", i, written_count, j);
+                        }
+                    }
+                } else {
+                    LOGINFO("Thread {} completed {} write requests successfully.", i, written_count);
+                }
+            });
+        }
+
+        // Join all threads
+        for (auto& thread : threads) {
+            thread.join();
         }
     }
 
@@ -469,6 +532,10 @@ TEST_F(DriveTest, io_on_different_threads) {
     io_on_worker_threads();
     io_on_user_threads();
     io_on_regular_threads();
+}
+
+TEST_F(DriveTest, write_in_high_load) {
+    async_write_test();
 }
 
 int main(int argc, char* argv[]) {

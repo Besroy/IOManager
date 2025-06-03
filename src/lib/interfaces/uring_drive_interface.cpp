@@ -66,15 +66,22 @@ uring_drive_channel::~uring_drive_channel() {
 }
 
 struct io_uring_sqe* uring_drive_channel::get_sqe_or_enqueue(drive_iocb* iocb) {
+    LOGINFOMOD(iomgr, "iocb_ptr={}, iocb={}, in_flight_ios={}, prepared_ios={}", (void*)iocb, iocb->to_string(),
+               m_in_flight_ios, m_prepared_ios);
     if (!can_submit()) {
         m_iocb_waitq.push(iocb);
+        LOGINFOMOD(iomgr, "push iocb={} to waitq, waitq size={}", (void *)iocb, m_iocb_waitq.size());
         return nullptr;
     }
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    LOGINFOMOD(iomgr, "iocb={}, sqe={}", (void *)iocb, (void *)sqe);
     if (!sqe) {
         // No available slots. Before enqueing we submit ios which were added as part of batch processing.
+        LOGINFOMOD(iomgr, "iocb={}, no available slots, submit ios", (void *)iocb);
         submit_ios();
+        LOGINFOMOD(iomgr, "iocb={}, submitted ios, pushing to Q, Q length={}", (void *)iocb, m_iocb_waitq.size());
         m_iocb_waitq.push(iocb);
+        LOGINFOMOD(iomgr, "push iocb={} to waitq, waitq size={}", (void *)iocb, m_iocb_waitq.size());
         return nullptr;
     }
 
@@ -83,20 +90,24 @@ struct io_uring_sqe* uring_drive_channel::get_sqe_or_enqueue(drive_iocb* iocb) {
 
 void uring_drive_channel::submit_ios() {
     if (m_prepared_ios != 0) {
+        LOGINFOMOD(iomgr, "submitting io");
         const auto ret = io_uring_submit(&m_ring);
         if (static_cast< int >(m_prepared_ios) < ret) {
             DEBUG_ASSERT(false, "prepared ios must be always equal or greater than just-submitted ios");
         }
+        LOGINFOMOD(iomgr, "submitted io, ret={}", ret);
         DEBUG_ASSERT_GT(ret, 0, "Facing an error in io_uring_submit");
         m_in_flight_ios += ret;
 
         m_prepared_ios -= ret;
+        LOGINFOMOD(iomgr, "after submit io, in_flight_ios={}, prepared_ios={}", m_in_flight_ios, m_prepared_ios);
     }
 }
 
 void uring_drive_channel::submit_if_needed(drive_iocb* iocb, struct io_uring_sqe* sqe, bool part_of_batch) {
     io_uring_sqe_set_data(sqe, (void*)iocb);
     ++m_prepared_ios;
+    LOGINFOMOD(iomgr, "iocb={}, sqe={}, part_of_batch={}, prepared_ios={}, submitting IOs", (void *)iocb, (void *)sqe, part_of_batch, m_prepared_ios);
     if (!part_of_batch) { submit_ios(); }
 }
 
@@ -128,22 +139,32 @@ static void prep_sqe_from_iocb(drive_iocb* iocb, struct io_uring_sqe* sqe) {
 }
 
 bool uring_drive_channel::can_submit() const {
+    LOGINFOMOD(iomgr, "check can_submit, m_in_flight_ios={}, m_prepared_ios={}, uring_per_thread_qdepth={}",
+               m_in_flight_ios, m_prepared_ios, IM_DYNAMIC_CONFIG(drive.uring_per_thread_qdepth));
     return (m_in_flight_ios + m_prepared_ios) <= IM_DYNAMIC_CONFIG(drive.uring_per_thread_qdepth);
 }
 
 void uring_drive_channel::drain_waitq() {
+    LOGINFOMOD(iomgr, "drain_waitq, waitq size={}", m_iocb_waitq.size());
     while (m_iocb_waitq.size() != 0) {
-        if (!can_submit()) { break; };
+        bool result = can_submit();
+        if (!result) {
+                LOGINFOMOD(iomgr, "cannot submit, m_inflight_ios={} m_prepared_ios=P{} uring_per_thread_qdepth={}",
+                           m_in_flight_ios, m_prepared_ios, IM_DYNAMIC_CONFIG(drive.uring_per_thread_qdepth));
+                break;
+        }
         struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
         if (sqe == nullptr) {
-            DEBUG_ASSERT(false, "Don't expect sqe to be full or unavailable");
+            LOGWARNMOD(iomgr, "sqe is null, don't expect sqe to be full or unavailable");
             return;
         };
 
         drive_iocb* iocb = pop_waitq();
+        LOGINFOMOD(iomgr, "drain_waitq, poped iocb={}, sqe={}, waitq size={}", (void *)iocb, (void *)sqe, m_iocb_waitq.size());
         prep_sqe_from_iocb(iocb, sqe);
         submit_if_needed(iocb, sqe, false /* batch */);
     }
+    LOGINFOMOD(iomgr, "exit drain_waitq, waitq size={}", m_iocb_waitq.size());
 }
 
 ///////////////////////////// UringDriveInterface /////////////////////////////////////////
@@ -219,14 +240,16 @@ folly::Future< std::error_code > UringDriveInterface::async_write(IODevice* iode
             DriveInterface::increment_outstanding_counter(iocb);
             auto sqe = t_uring_ch->get_sqe_or_enqueue(iocb);
             if (sqe == nullptr) { return; }
-
+            LOGINFOMOD(iomgr, "preparing write, iocb={}, sqe={}, seq.size={}, part_of_batch={}, fd={}", (void *)iocb, (void *)sqe, sqe->len, part_of_batch, iocb->iodev->fd());
             io_uring_prep_write(sqe, iocb->iodev->fd(), (const void*)iocb->get_data(), iocb->size, iocb->offset);
             t_uring_ch->submit_if_needed(iocb, sqe, part_of_batch);
         };
 
         if (iomanager.this_reactor() != nullptr) {
+	    LOGINFOMOD(iomgr, "submitting in this thread, this_reactor={}", (void *)iomanager.this_reactor());
             submit_in_this_thread(iocb, part_of_batch);
         } else {
+	    LOGINFOMOD(iomgr, "submitting in random worker, this_reactor={}", (void *)iomanager.this_reactor());
             iomanager.run_on_forget(reactor_regex::random_worker,
                                     [=]() { submit_in_this_thread(iocb, part_of_batch); });
         }
@@ -249,14 +272,16 @@ folly::Future< std::error_code > UringDriveInterface::async_writev(IODevice* iod
         DriveInterface::increment_outstanding_counter(iocb);
         auto sqe = t_uring_ch->get_sqe_or_enqueue(iocb);
         if (sqe == nullptr) { return; }
-
+        LOGINFOMOD(iomgr, "preparing write, iocb={}, sqe={}, seq.size={}, part_of_batch={}, fd={}", (void *)iocb, (void *)sqe, sqe->len, part_of_batch, iocb->iodev->fd());
         io_uring_prep_writev(sqe, iocb->iodev->fd(), iocb->get_iovs(), iocb->iovcnt, iocb->offset);
         t_uring_ch->submit_if_needed(iocb, sqe, part_of_batch);
     };
 
     if (iomanager.this_reactor() != nullptr) {
+	LOGINFOMOD(iomgr, "submitting in this thread, this_reactor={}", (void *)iomanager.this_reactor());
         submit_in_this_thread(iocb, part_of_batch);
     } else {
+	LOGINFOMOD(iomgr, "submitting in random worker, this_reactor={}", (void *)iomanager.this_reactor());
         iomanager.run_on_forget(reactor_regex::random_worker, [=]() { submit_in_this_thread(iocb, part_of_batch); });
     }
     return ret;
@@ -283,7 +308,7 @@ folly::Future< std::error_code > UringDriveInterface::async_read(IODevice* iodev
             DriveInterface::increment_outstanding_counter(iocb);
             auto sqe = t_uring_ch->get_sqe_or_enqueue(iocb);
             if (sqe == nullptr) { return; }
-
+            LOGINFOMOD(iomgr, "preparing read, iocb={}, sqe={}, sqe.size={}, part_of_batch={}, fd={}", (void *)iocb, (void *)sqe, sqe->len, part_of_batch, iocb->iodev->fd());
             io_uring_prep_read(sqe, iocb->iodev->fd(), (void*)iocb->get_data(), iocb->size, iocb->offset);
             t_uring_ch->submit_if_needed(iocb, sqe, part_of_batch);
         };
@@ -312,7 +337,7 @@ folly::Future< std::error_code > UringDriveInterface::async_readv(IODevice* iode
         DriveInterface::increment_outstanding_counter(iocb);
         auto sqe = t_uring_ch->get_sqe_or_enqueue(iocb);
         if (sqe == nullptr) { return; }
-
+        LOGINFOMOD(iomgr, "preparing read, iocb={}, sqe={}, sqe.size={}, part_of_batch={}, fd={}", (void *)iocb, (void *)sqe, sqe->len, part_of_batch, iocb->iodev->fd());
         io_uring_prep_readv(sqe, iocb->iodev->fd(), iocb->get_iovs(), iocb->iovcnt, iocb->offset);
         t_uring_ch->submit_if_needed(iocb, sqe, part_of_batch);
     };
@@ -489,6 +514,8 @@ void UringDriveInterface::handle_completions() {
         iocb->result = cqe->res;
         io_uring_cqe_seen(&t_uring_ch->m_ring, cqe);
 
+        LOGINFOMOD(iomgr, "Received completion event, iocb={} Result={}", iocb->to_string(), iocb->result);
+
         // Don't access cqe beyond this point.
         if (sisl_likely(iocb->result >= 0)) {
             if (sisl_likely(static_cast< uint64_t >(iocb->result) == iocb->size)) {
@@ -509,10 +536,10 @@ void UringDriveInterface::handle_completions() {
                 iocb->update_iovs_on_partial_result();
                 // retry I/O with remaining unset data;
                 t_uring_ch->m_iocb_waitq.push(iocb);
-                --(t_uring_ch->m_in_flight_ios);
+                LOGINFOMOD(iomgr, "iocb={}, content={}, waitq size={}", (void*)iocb, iocb->to_string(), t_uring_ch->m_iocb_waitq.size());
             }
         } else {
-            LOGERRORMOD(iomgr, "Error in completion of io, iocb={}, result={}, retry={}", (void*)iocb, iocb->result,
+            LOGERRORMOD(iomgr, "Error in completion of io, iocb_ptr={} iocb={} result={}, retry={}", (void*)iocb, iocb->to_string(), iocb->result,
                         iocb->resubmit_cnt);
             if ((iocb->result != -EAGAIN) && iocb->resubmit_cnt++ > IM_DYNAMIC_CONFIG(drive.max_resubmit_cnt)) {
                 // EAGAIN won't increase resubmit_cnt;
@@ -523,14 +550,18 @@ void UringDriveInterface::handle_completions() {
                 // if disk driver return EAGAIN, keep retrying unconditionally;
                 // Retry IO by pushing it to waitq which will get scheduled later.
                 t_uring_ch->m_iocb_waitq.push(iocb);
+                LOGINFOMOD(iomgr, "wait for retry, iocb={}, content={}, waitq size={}", (void*)iocb, iocb->to_string(), t_uring_ch->m_iocb_waitq.size());
             }
         }
+        --(t_uring_ch->m_in_flight_ios);
+        LOGINFOMOD(iomgr, "handled one completion, in_flight_ios={}", t_uring_ch->m_in_flight_ios);
         t_uring_ch->drain_waitq();
     } while (true);
 }
 
 void UringDriveInterface::complete_io(drive_iocb* iocb) {
-    --(t_uring_ch->m_in_flight_ios);
+    LOGINFOMOD(iomgr, "io completed, iocb_ptr={} iocb={} result={}, in_flight_ios={}", (void*)iocb, iocb->to_string(), iocb->result,
+               t_uring_ch->m_in_flight_ios);
 
 #ifdef _PRERELEASE
     if (DriveInterface::inject_delay_if_needed(iocb, [this](drive_iocb* iocb) { complete_io(iocb); })) { return; }

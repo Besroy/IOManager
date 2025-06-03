@@ -34,7 +34,10 @@ SISL_OPTION_GROUP(test_io,
                    ::cxxopts::value< std::vector< std::string > >(), "path [...]"),
                   (device_size, "", "device_size", "size of devices to do IO on",
                    ::cxxopts::value< uint64_t >()->default_value("1073741824"), "size"),
-                  (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"))
+                  (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"),
+                  (read_ratio, "", "read_ratio", "read ratio in [0,100]", ::cxxopts::value< int >()->default_value("0"),
+                   "number"),
+                  (io_flag, "", "io_flag", "use direct io or not, 0 is direct io, 1 is buffer io", ::cxxopts::value< uint32_t >()->default_value("0"), "number"))
 
 #define ENABLED_OPTIONS logging, iomgr, test_io, config
 SISL_OPTIONS_ENABLE(ENABLED_OPTIONS)
@@ -43,9 +46,10 @@ TEST(IOMgrTest, basic_io_test) {
     const auto nthreads = SISL_OPTIONS["num_threads"].as< uint32_t >();
     const auto is_spdk = SISL_OPTIONS["spdk"].as< bool >();
     auto examiner = std::make_shared< iomgr::IOExaminer >(nthreads, false /* integrated mode */, is_spdk);
+    auto io_flag = SISL_OPTIONS["io_flag"].as< uint32_t >();
 
     // Create an add the device
-    std::vector< std::string > devs{fmt::format("/tmp/io_test_{}", is_spdk ? "spdk" : "epoll")};
+    std::vector< std::string > devs{fmt::format("/usr/src/app/disk/io_test_{}", is_spdk ? "spdk" : "epoll")};
     if (SISL_OPTIONS.count("device_list")) { devs = SISL_OPTIONS["device_list"].as< std::vector< std::string > >(); }
     const auto dev_size = SISL_OPTIONS["device_size"].as< uint64_t >();
     for (const auto& dev : devs) {
@@ -57,13 +61,21 @@ TEST(IOMgrTest, basic_io_test) {
             std::filesystem::resize_file(file_path, dev_size);
             ::close(fd);
         }
-        examiner->add_device(dev, O_RDWR);
+        auto flag = O_RDWR;
+        if (io_flag == 0) {
+            LOGINFO("Adding device with direct IO");
+            flag |= O_DIRECT;
+        }
+        examiner->add_device(dev, flag);
     }
 
+    int read_ratio = SISL_OPTIONS["read_ratio"].as< int >();
+    int write_ratio = 100 - read_ratio;
+    LOGINFO("read_ratio: {}, write_ratio: {}", read_ratio, write_ratio);
     IOJobCfg cfg;
     cfg.max_disk_capacity = dev_size;
     cfg.run_time = SISL_OPTIONS["run_time"].as< uint32_t >();
-    cfg.io_dist = {{io_type_t::write, 100}, {io_type_t::read, 0}};
+    cfg.io_dist = {{io_type_t::write, write_ratio}, {io_type_t::read, read_ratio}};
     cfg.load_type = (load_type_t)SISL_OPTIONS["load_type"].as< uint32_t >();
     cfg.io_blk_size = SISL_OPTIONS["blk_size"].as< uint32_t >()*1024;
     cfg.qdepth = SISL_OPTIONS["qdepth"].as< uint32_t >();
